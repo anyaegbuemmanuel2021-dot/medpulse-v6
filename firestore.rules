@@ -1,0 +1,485 @@
+// File: firestore.rules
+// Complete Firestore Security Rules — MedPulse v6
+// Covers ALL existing + new Phase 2/3 collections
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ========================================================================
+    // HELPER FUNCTIONS
+    // ========================================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isSuperAdmin() {
+      return isAdmin() &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'super_admin';
+    }
+
+    function hasPermission(permission) {
+      let adminDoc = get(/databases/$(database)/documents/admins/$(request.auth.uid));
+      if (!adminDoc.data.keys().hasAny(['role'])) return false;
+      let roleDoc = get(/databases/$(database)/documents/system_roles/$(adminDoc.data.role));
+      return roleDoc.data.permissions.hasAny([permission]) ||
+        (adminDoc.data.keys().hasAny(['overridePermissions']) &&
+         adminDoc.data.overridePermissions.hasAny([permission]));
+    }
+
+    function isNotSuspended() {
+      return isAuthenticated() &&
+        (!exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+         !get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isSuspended);
+    }
+
+    function isNotBanned() {
+      return isAuthenticated() &&
+        (!exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+         !get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isBanned);
+    }
+
+    function isActiveUser() {
+      return isAuthenticated() && isNotSuspended() && isNotBanned();
+    }
+
+    function isConversationParticipant(conversationId) {
+      return isAuthenticated() &&
+        get(/databases/$(database)/documents/conversations/$(conversationId))
+          .data.participants.hasAny([request.auth.uid]);
+    }
+
+    function isOrganizationAdmin(orgId) {
+      return isAuthenticated() &&
+        exists(/databases/$(database)/documents/organization_members/$(orgId + '_' + request.auth.uid)) &&
+        get(/databases/$(database)/documents/organization_members/$(orgId + '_' + request.auth.uid))
+          .data.role == 'admin';
+    }
+
+    // ========================================================================
+    // USERS
+    // ========================================================================
+
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) ||
+        hasPermission('users:write') ||
+        hasPermission('users:suspend') ||
+        hasPermission('users:verify');
+      allow delete: if isSuperAdmin();
+    }
+
+    // ========================================================================
+    // POSTS & CONTENT
+    // ========================================================================
+
+    match /posts/{postId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.authorId) || hasPermission('content:moderate');
+      allow delete: if isOwner(resource.data.authorId) || hasPermission('content:remove');
+    }
+
+    match /comments/{commentId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.authorId) || hasPermission('content:moderate');
+      allow delete: if isOwner(resource.data.authorId) || hasPermission('content:remove');
+    }
+
+    match /likes/{likeId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+    // ========================================================================
+    // MESSAGING / CONVERSATIONS
+    // ========================================================================
+
+    match /conversations/{conversationId} {
+      allow read: if isAuthenticated() &&
+        resource.data.participants.hasAny([request.auth.uid]);
+      allow create: if isActiveUser();
+      allow update: if isConversationParticipant(conversationId) ||
+        hasPermission('content:moderate');
+      allow delete: if isSuperAdmin();
+
+      match /messages/{messageId} {
+        allow read: if isConversationParticipant(conversationId);
+        allow create: if isActiveUser() &&
+          isConversationParticipant(conversationId);
+        allow update: if isOwner(resource.data.senderId) ||
+          hasPermission('content:moderate');
+        allow delete: if isSuperAdmin();
+      }
+    }
+
+    // Typing indicators — users only write their own
+    match /typing/{typingId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid;
+    }
+
+    // ========================================================================
+    // COMMUNITIES
+    // ========================================================================
+
+    match /communities/{communityId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.creatorId) ||
+        hasPermission('communities:moderate');
+      allow delete: if isSuperAdmin() || hasPermission('communities:delete');
+    }
+
+    match /community_members/{memberId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isAuthenticated();
+      allow delete: if isAuthenticated();
+    }
+
+    // ========================================================================
+    // HEALTHCARE PROFILES
+    // ========================================================================
+
+    match /healthcare_profiles/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId) && isActiveUser();
+      allow update: if isOwner(userId) || hasPermission('users:verify');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /verification_requests/{requestId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.userId == request.auth.uid || hasPermission('users:verify'));
+      allow create: if isActiveUser();
+      allow update: if hasPermission('users:verify');
+      allow delete: if isSuperAdmin();
+    }
+
+    // ========================================================================
+    // ORGANIZATIONS
+    // ========================================================================
+
+    match /organizations/{orgId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOrganizationAdmin(orgId) || hasPermission('communities:moderate');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /organization_members/{memberId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update: if isAuthenticated();
+      allow delete: if isAuthenticated();
+    }
+
+    match /organization_follows/{followId} {
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated();
+    }
+
+    // ========================================================================
+    // TRUST & SAFETY
+    // ========================================================================
+
+    match /investigations/{investigationId} {
+      allow read: if hasPermission('security:view_logs') ||
+        (isAuthenticated() && resource.data.reporterIds.hasAny([request.auth.uid]));
+      allow create: if isActiveUser();
+      allow update: if hasPermission('security:view_logs');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /user_strikes/{strikeId} {
+      allow read: if hasPermission('users:suspend') ||
+        isOwner(resource.data.userId);
+      allow create: if hasPermission('users:suspend') ||
+        request.resource.data.appliedBy == 'system';
+      allow update: if hasPermission('users:suspend');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /appeals/{appealId} {
+      allow read: if isOwner(resource.data.userId) || hasPermission('users:suspend');
+      allow create: if isActiveUser();
+      allow update: if hasPermission('users:suspend');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /reputation_scores/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin() || request.resource.data.userId == request.auth.uid;
+    }
+
+    // ========================================================================
+    // SECURITY
+    // ========================================================================
+
+    match /security_events/{eventId} {
+      allow read: if hasPermission('security:view_logs');
+      allow create: if isAuthenticated();
+      allow update: if hasPermission('security:view_logs');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /ip_blocks/{ip} {
+      allow read: if hasPermission('security:manage_blocks');
+      allow write: if hasPermission('security:manage_blocks') || isSuperAdmin();
+    }
+
+    match /device_fingerprints/{fingerprintId} {
+      allow read: if hasPermission('security:view_logs');
+      allow create: if isAuthenticated();
+      allow update: if hasPermission('security:view_logs');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /bot_scores/{userId} {
+      allow read: if isOwner(userId) || hasPermission('security:view_logs');
+      allow write: if hasPermission('security:manage_blocks') || isSuperAdmin();
+    }
+
+    // ========================================================================
+    // AUTOMATION RULES
+    // ========================================================================
+
+    match /automation_rules/{ruleId} {
+      allow read: if isAdmin();
+      allow create: if hasPermission('security:manage_rules');
+      allow update: if hasPermission('security:manage_rules');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /rule_executions/{executionId} {
+      allow read: if hasPermission('security:manage_rules');
+      allow create: if isAuthenticated();
+      allow update: if false;
+      allow delete: if isSuperAdmin();
+    }
+
+    // ========================================================================
+    // AUDIT LOGS — IMMUTABLE
+    // ========================================================================
+
+    match /audit_logs/{logId} {
+      allow read: if hasPermission('admin:view_audit');
+      allow create: if isAuthenticated();
+      allow update: if false;   // IMMUTABLE — no updates ever
+      allow delete: if false;   // IMMUTABLE — no deletes ever
+    }
+
+    match /audit_logs_archive/{logId} {
+      allow read: if isSuperAdmin();
+      allow create: if isAuthenticated();
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ========================================================================
+    // ADMIN SYSTEM
+    // ========================================================================
+
+    match /admins/{adminId} {
+      allow read: if isAdmin() &&
+        (isOwner(adminId) || isSuperAdmin());
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() || isOwner(adminId);
+      allow delete: if isSuperAdmin();
+    }
+
+    match /system_roles/{roleId} {
+      allow read: if isAdmin();
+      allow create: if hasPermission('admin:manage_roles');
+      allow update: if hasPermission('admin:manage_roles');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /system_permissions/{permissionId} {
+      allow read: if isAdmin();
+      allow write: if isSuperAdmin();
+    }
+
+    match /admin_notifications/{notifId} {
+      allow read: if isAdmin();
+      allow create: if isAuthenticated();
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ========================================================================
+    // LEGAL OPERATIONS
+    // ========================================================================
+
+    match /legal_policies/{policyId} {
+      allow read: if true;   // Public — anyone can read policies
+      allow create: if hasPermission('legal:manage_policies');
+      allow update: if hasPermission('legal:manage_policies');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /policy_acceptances/{acceptanceId} {
+      allow read: if isSuperAdmin() ||
+        isOwner(resource.data.userId);
+      allow create: if isAuthenticated();
+      allow update: if false;
+      allow delete: if isSuperAdmin();
+    }
+
+    // ========================================================================
+    // COPYRIGHT
+    // ========================================================================
+
+    match /copyright_claims/{claimId} {
+      allow read: if isOwner(resource.data.claimantUserId) ||
+        hasPermission('legal:copyright');
+      allow create: if isActiveUser();
+      allow update: if hasPermission('legal:copyright');
+      allow delete: if isSuperAdmin();
+    }
+
+    // ========================================================================
+    // SUPPORT CENTER
+    // ========================================================================
+
+    match /support_tickets/{ticketId} {
+      allow read: if isOwner(resource.data.userId) || hasPermission('users:read');
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.userId) || hasPermission('users:read');
+      allow delete: if isSuperAdmin();
+    }
+
+    match /knowledge_base/{articleId} {
+      allow read: if true;    // Public
+      allow create: if hasPermission('legal:manage_policies');
+      allow update: if hasPermission('legal:manage_policies');
+      allow delete: if isSuperAdmin();
+    }
+
+    // ========================================================================
+    // PLATFORM HEALTH
+    // ========================================================================
+
+    match /platform_health/{snapshotId} {
+      allow read: if isAdmin();
+      allow create: if true;   // Cloud Functions write this
+      allow update: if false;
+      allow delete: if isSuperAdmin();
+    }
+
+    match /health_incidents/{incidentId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /health_alerts/{alertId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin() || isSuperAdmin();
+    }
+
+    // ========================================================================
+    // EMERGENCY CONTROLS
+    // ========================================================================
+
+    match /emergency_controls/{action} {
+      allow read: if isAuthenticated();    // All users can read (for UI gating)
+      allow write: if hasPermission('admin:emergency');
+    }
+
+    // ========================================================================
+    // NOTIFICATIONS
+    // ========================================================================
+
+    match /notifications/{notifId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated();
+      allow update: if isOwner(resource.data.userId);
+      allow delete: if isOwner(resource.data.userId);
+    }
+
+    // ========================================================================
+    // ANALYTICS
+    // ========================================================================
+
+    match /analytics/{docId} {
+      allow read: if isAdmin() || isOwner(resource.data.userId);
+      allow write: if isAuthenticated();
+    }
+
+    match /analytics_aggregates/{dateKey} {
+      allow read: if isAdmin();
+      allow write: if isSuperAdmin() || request.auth == null;  // Cloud Functions
+    }
+
+    // ========================================================================
+    // EVENTS
+    // ========================================================================
+
+    match /events/{eventId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.creatorId) || hasPermission('communities:moderate');
+      allow delete: if isOwner(resource.data.creatorId) || isSuperAdmin();
+    }
+
+    // ========================================================================
+    // MARKETPLACE
+    // ========================================================================
+
+    match /marketplace_listings/{listingId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.sellerId) || hasPermission('content:moderate');
+      allow delete: if isOwner(resource.data.sellerId) || isSuperAdmin();
+    }
+
+    // ========================================================================
+    // STORIES
+    // ========================================================================
+
+    match /stories/{storyId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow update: if isOwner(resource.data.authorId);
+      allow delete: if isOwner(resource.data.authorId) || hasPermission('content:remove');
+    }
+
+    // ========================================================================
+    // FOLLOWS / SOCIAL
+    // ========================================================================
+
+    match /follows/{followId} {
+      allow read: if isAuthenticated();
+      allow create: if isActiveUser();
+      allow delete: if isAuthenticated() &&
+        resource.data.followerId == request.auth.uid;
+    }
+
+    // ========================================================================
+    // MODERATION QUEUE
+    // ========================================================================
+
+    match /moderation_queue/{itemId} {
+      allow read: if hasPermission('content:moderate');
+      allow create: if isAuthenticated();
+      allow update: if hasPermission('content:moderate');
+      allow delete: if hasPermission('content:moderate');
+    }
+
+  }
+}
